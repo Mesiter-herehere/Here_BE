@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 import jwt
+import bcrypt
 
 app = FastAPI()
 
@@ -20,9 +21,10 @@ client = MongoClient(MONGODB_URL)
 db = client.shinhuiseong07 
 collection = db.users
 
-SECRET_KEY = "2024swmesitergogogowhiteing"  #
-ALGORITHM = "HS256" 
+SECRET_KEY = "2024swmesitergogogowhiteing"  
+ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 class User(BaseModel):
     school: str
@@ -47,7 +49,10 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
 @app.post("/api/signup")
 async def signup(user: User):
     try:
+        hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
         user_dict = user.dict()
+        user_dict['password'] = hashed_password.decode('utf-8')
+        
         result = collection.insert_one(user_dict)
         
         if result.inserted_id:
@@ -61,17 +66,45 @@ async def signup(user: User):
 async def signin(user: UserLogin):
     try:
         user_in_db = collection.find_one({"email": user.email})
-        if user_in_db and user_in_db["password"] == user.password:
+        
+        if user_in_db and bcrypt.checkpw(user.password.encode('utf-8'), user_in_db["password"].encode('utf-8')):
             access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
             access_token = create_access_token(
                 data={"sub": user.email}, expires_delta=access_token_expires
             )
-            refresh_token = create_access_token(data={"sub": user.email})
+            refresh_token = create_access_token(
+                data={"sub": user.email},
+                expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+            )
+
+            collection.update_one({"email": user.email}, {"$set": {"refresh_token": refresh_token}})
+            
             return {"access": access_token, "refresh": refresh_token}
         else:
             raise HTTPException(status_code=400, detail="Invalid credentials")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/refresh")
+async def refresh_token(refresh_token: str):
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        user_in_db = collection.find_one({"email": email})
+        if user_in_db and user_in_db.get("refresh_token") == refresh_token:
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            new_access_token = create_access_token(
+                data={"sub": email}, expires_delta=access_token_expires
+            )
+            return {"access": new_access_token}
+        else:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token has expired")
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 if __name__ == "__main__":
     import uvicorn
